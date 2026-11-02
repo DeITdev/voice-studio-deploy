@@ -1,0 +1,27 @@
+# ============================================================
+# Voicebox Web UI VM (No GPU Required)
+# Copy this `web-vm` folder to your non-GPU VM and run:
+#   cp .env.example .env   # edit DGX_BACKEND_URL with your DGX Spark IP
+#   docker compose up -d --build
+# ============================================================
+
+services:
+  voicebox-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicebox-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-17600}:80"
+    environment:
+      # URL of the Voicebox backend running on your NVIDIA DGX Spark GPU VM
+      - DGX_BACKEND_URL=${DGX_BACKEND_URL:-http://10.0.0.2:17493}
+      # Keep as `/api` to route browser calls through this container's Nginx proxy
+      # (avoids CORS issues and SPA route collisions), or set to a full URL if desired.
+      - FRONTEND_SERVER_URL=${FRONTEND_SERVER_URL:-/api}
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G

@@ -1,0 +1,45 @@
+# ============================================================
+# Voicebox Headless GPU Backend (NVIDIA DGX Spark GPU VM)
+# Copy this `dgx-gpu-vm` folder to your DGX Spark VM and run:
+#   cp .env.example .env
+#   docker compose up -d --build
+# ============================================================
+
+services:
+  voicebox-dgx-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTORCH_VARIANT: ${PYTORCH_VARIANT:-cuda}
+        CUDA_VERSION: ${CUDA_VERSION:-cu128}
+    container_name: voicebox-dgx-backend
+    restart: unless-stopped
+
+    # Shared memory / host IPC recommended for PyTorch CUDA on DGX systems
+    ipc: host
+
+    ports:
+      # Exposes the Voicebox API on the DGX VM so the Web UI VM can connect to it
+      - "0.0.0.0:${BACKEND_PORT:-17493}:17493"
+
+    volumes:
+      # All downloaded TTS, Whisper ASR, and Dictation/LLM models are stored here on the DGX VM
+      - ${MODELS_HOST_DIR:-./models}:/home/voicebox/.cache/huggingface
+
+      # Persistent storage for voice profiles, SQLite database, captures, and generated audio
+      - ${DATA_HOST_DIR:-./data}:/app/data
+
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+      # Optional comma-separated list of allowed CORS origins (e.g. http://<WEB-VM-IP>:17600)
+      - VOICEBOX_CORS_ORIGINS=${VOICEBOX_CORS_ORIGINS:-}
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
