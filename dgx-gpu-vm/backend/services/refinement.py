@@ -1,35 +1,95 @@
-"""
-Transcript refinement — turns a raw STT output into a cleaner version by
-running it through the local LLM with a toggle-driven system prompt.
+"""Dictation transcript refinement (Spec 3 / Waves 1.1 + 2.1).
 
-The prompt is assembled server-side from a set of boolean flags so that the
-UI exposes user-friendly toggles ("Smart cleanup", "Remove self-corrections")
-rather than a raw prompt editor. Adding a new refinement behaviour is a matter
-of appending one helper below and wiring one toggle on the frontend.
+Adapted from voicebox (https://github.com/jamiepine/voicebox), MIT License,
+Copyright (c) voicebox contributors.
+
+Two tiers, both applied only to FINAL transcripts (never partials):
+
+* Phase 1 (Wave 1.1, always on, no LLM): ``collapse_repetitive_artifacts()``
+  strips Whisper hallucination loops. Identical on every platform.
+* Phase 2 (Wave 2.1, only when an LLM backend is configured):
+  ``refine_transcript()`` runs the collapsed text through the user's local
+  LLM (Ollama/LM Studio/OpenAI-compat via services.llm_backend) with a
+  "text filter, not an assistant" prompt — removing disfluencies and filler
+  words, applying self-corrections, and preserving technical terms. The
+  few-shot examples ride as STRUCTURED chat turns because small models
+  echo inline examples. With no LLM configured behavior is identical
+  pass-through everywhere (cross-platform default parity).
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 
-from . import llm as llm_service
+logger = logging.getLogger("omnivoice.refinement")
+
+# Hard wall-clock budget (seconds) for a single dictation refinement LLM call.
+# The dictation FINAL must never be delayed longer than this by a slow or dead
+# LLM endpoint — refinement is best-effort and falls back to the unrefined
+# (but polished) text on timeout. 4s keeps a healthy local model (Ollama /
+# LM Studio, sub-second on the tiny cleanup prompt) fully usable while turning
+# the old worst case — a placeholder/dead endpoint blocking the send ~51s until
+# the widget's 15s fallback fired — into a bounded ~4s at most. Env-tunable so
+# power users on a slow local LLM can raise it. Guarded by the regression tests
+# in tests/backend/services/test_refinement_llm.py and tests/test_capture_ws.py.
+_DEFAULT_REFINE_TIMEOUT_S = 4.0
 
 
-# A run that repeats this many times gets collapsed before the LLM sees
-# the transcript. Whisper occasionally loops content hundreds of times
-# when audio trails off — "URL URL URL…" (single word), "thanks for
-# watching thanks for watching…" (multi-word phrase), or
-# "谢谢观看谢谢观看…" (CJK with no spaces). Smaller refine models truncate
-# legitimate output to "make room" for the loop, and bigger ones echo
-# the run verbatim because "never omit ideas" overrides the no-garbage
-# heuristic. Stripping deterministically sidesteps both.
+def _refine_timeout_s() -> float:
+    """The refinement LLM budget in seconds (OMNIVOICE_REFINE_TIMEOUT_S).
+
+    Falls back to :data:`_DEFAULT_REFINE_TIMEOUT_S` on an unset/invalid/non-
+    positive value so a bad env var can never disable the bound."""
+    raw = os.environ.get("OMNIVOICE_REFINE_TIMEOUT_S", "")
+    try:
+        v = float(raw)
+        if v > 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return _DEFAULT_REFINE_TIMEOUT_S
+
+
+# Most-recent refinement outcome, so the Settings panel can tell the user when a
+# configured LLM is actually failing/timing out (the honesty layer behind the
+# `llm_ready` flag, which only means "an endpoint is configured"). Best-effort,
+# process-local, cleared on success.
+_last_refine_status: dict | None = None
+
+
+def _note_refine_status(*, ok: bool, reason: str | None = None) -> None:
+    global _last_refine_status
+    _last_refine_status = {"ok": bool(ok), "reason": reason, "at": time.time()}
+
+
+def get_last_refine_status() -> dict | None:
+    """The last refinement outcome as ``{ok, reason, at}`` or None if refinement
+    hasn't run this session. ``ok=False`` with ``reason`` ("timeout" or a short
+    error string) means a configured LLM failed the most recent final."""
+    return dict(_last_refine_status) if _last_refine_status else None
+
+
+def _short_reason(exc: Exception) -> str:
+    """A compact, non-leaky label for a refinement failure (for the UI hint)."""
+    name = type(exc).__name__
+    if "Timeout" in name or "timeout" in str(exc).lower():
+        return "timeout"
+    return name
+
+# A token (or unit) must repeat at least this many times consecutively to be
+# treated as an STT artifact. Rhetorical repetition ("no, no, no, no, no" —
+# five repeats) stays below the threshold and survives.
 _REPETITION_RUN_THRESHOLD = 6
 
-# Upper bound on the length of a repeating unit that the character-level
-# pass will detect. Covers every Whisper hallucination phrase we've
-# observed ("Please like and subscribe to my channel." ≈ 41 chars,
-# "Subtitles by the Amara.org community" ≈ 36 chars) while being short
-# enough that coincidental long-phrase repetition stays below the
-# threshold in legitimate speech.
+# Upper bound on the repeating unit the character-level pass looks for.
+# Long enough for multi-word loop phrases, short enough to keep the
+# non-greedy regex cheap on long transcripts.
 _MAX_REPETITION_UNIT_CHARS = 60
 
 
@@ -45,19 +105,18 @@ def collapse_repetitive_artifacts(text: str, min_run: int = _REPETITION_RUN_THRE
 
     1. Word-level: any token repeated ``min_run``+ times consecutively
        (with surrounding punctuation stripped for comparison). Catches
-       single-word loops like "URL URL URL…" and normalizes punctuated
-       variants like "URL, URL, URL, URL, URL, URL".
-    2. Character-level: any substring 2–60 chars long that repeats
+       single-word loops like "URL URL URL..." and punctuated variants.
+    2. Character-level: any substring 2-60 chars long that repeats
        ``min_run``+ times immediately after itself. Catches multi-word
-       English loops ("thanks for watching" × 6) that the word-level
-       pass misses (no consecutive identical tokens) and CJK loops
-       ("谢谢观看" × 6) where ``text.split()`` yields a single unsplit
-       token.
+       loops ("thanks for watching" x 6) that the word-level pass misses
+       (no consecutive identical tokens) and loops in no-space scripts
+       where ``text.split()`` yields a single unsplit token.
 
-    Both passes preserve rhetorical repetition: "no, no, no, no, no"
-    (5 repeats) and "yeah yeah yeah" (3 repeats) stay in the transcript
-    because they don't cross the threshold.
+    Both passes preserve rhetorical repetition: five "no"s or three
+    "yeah"s stay in the transcript because they don't cross the threshold.
     """
+    if not text:
+        return text
     collapsed = _collapse_word_runs(text, min_run)
     collapsed = _collapse_character_runs(collapsed, min_run)
     return collapsed
@@ -105,10 +164,12 @@ def _collapse_character_runs(text: str, min_run: int) -> str:
     if result == text:
         return text
     # Stripping a run leaves double whitespace where the loop used to
-    # bridge surrounding context; normalize so the LLM prompt stays
-    # clean. Only runs when we actually modified the text so transcripts
-    # that didn't hit any loop keep their original whitespace.
+    # bridge surrounding context; normalize only when we actually modified
+    # the text so untouched transcripts keep their original whitespace.
     return re.sub(r"\s+", " ", result).strip()
+
+
+# ── Phase 2: optional local-LLM refinement (Wave 2.1) ──────────────────────
 
 
 @dataclass
@@ -155,6 +216,7 @@ Forbidden:
 - Do not summarize, shorten, or omit ideas the speaker expressed.
 - Do not add words, examples, explanations, code, or details the speaker did not say.
 - Do not rephrase or substitute synonyms for the speaker's word choices. Keep their vocabulary.
+- Never translate the transcript. Keep the output in the language the speaker used.
 - Do not wrap the output in quotes, code fences, or a preamble like "Here is the cleaned version". Output only the cleaned transcript itself."""
 
 _SMART_CLEANUP = """Remove disfluencies and empty filler words that interrupt the flow:
@@ -205,25 +267,10 @@ def build_refinement_prompt(flags: RefinementFlags) -> str:
 # Few-shot examples passed as real chat turns (user → assistant pairs).
 # Inline examples inside the system prompt caused small models (0.6B)
 # to pattern-match and echo the example's output for unrelated technical
-# inputs — structured chat turns sidestep that because the model sees
-# them as prior conversation, not as a template to complete.
-#
-# Each pair is chosen to pin one rule the model is prone to breaking:
-#   1. general cleanup + punctuation
-#   2. imperative → stays imperative (do not follow)
-#   3. question → stays question (do not answer)
-#   4. self-correction with a technical term (do not rewrite jargon)
-# Pairs avoid "how-to"-sounding imperatives (e.g. "tell me a joke")
-# because those bias the model back into assistant mode even when the
-# demonstration shows the opposite. Pick imperatives whose natural
-# response would be obviously wrong ("Remind me to call mom" is not
-# something the model would answer) so the transformation is the
-# only coherent output.
-# Order matters: models weight the examples closest to the real user
-# turn most heavily. The last two slots are reserved for the hardest
-# rules to pin — self-correction (which 4B silently flips if no demo)
-# and entertainment-imperatives (which collapse back into assistant
-# mode without a fresh anchor). Everything else goes earlier.
+# inputs — structured chat turns sidestep that. Ordering is deliberate:
+# models weight the examples closest to the real user turn most heavily,
+# so the hardest rules (self-correction, entertainment-imperatives that
+# collapse the model back into assistant mode) sit last.
 REFINEMENT_EXAMPLES: list[tuple[str, str]] = [
     (
         "so um yeah i was thinking like maybe we could you know try that new place tonight if you're free",
@@ -241,19 +288,10 @@ REFINEMENT_EXAMPLES: list[tuple[str, str]] = [
         "write an email to um my manager saying i need to push the deadline",
         "Write an email to my manager saying I need to push the deadline.",
     ),
-    # Self-correction: one demo. Adding a second reliably fixes 0.6B but
-    # also crowds out the imperative-stays-imperative anchor, which is
-    # the more user-visible failure mode. 4B generalizes from one demo
-    # across cue variants; 0.6B occasionally keeps the retracted value
-    # and that's accepted as the trade-off.
     (
         "the flight is at seven am no actually six am on friday",
         "The flight is at six am on Friday.",
     ),
-    # Two consecutive entertainment-imperative demos at the end. One was
-    # enough to fix the pattern when we had 5 examples total; once we
-    # added self-correction the single joke demo lost its recency hold,
-    # so we double up to re-establish the pattern.
     (
         "write a haiku about um the ocean",
         "Write a haiku about the ocean.",
@@ -264,32 +302,152 @@ REFINEMENT_EXAMPLES: list[tuple[str, str]] = [
     ),
 ]
 
+# settings_store key holding the user's refinement config (plain JSON).
+_SETTINGS_KEY = "dictation_refinement"
 
-async def refine_transcript(
+# LLM Skills registry id — Settings → LLM Skills can disable refinement's LLM
+# use or route it to a specific provider. Disabled == identical pass-through
+# (the same path as "no LLM configured").
+_SKILL_ID = "dictation_refinement"
+
+
+def _skill_llm():
+    """The skill-resolved backend (OffBackend when disabled/unconfigured)."""
+    from services import llm_skills
+    from services.llm_backend import get_active_llm_backend
+
+    return llm_skills.skill_backend(_SKILL_ID, active=get_active_llm_backend)
+
+
+def get_refinement_config() -> dict:
+    """Read the persisted config: {auto, smart_cleanup, self_correction,
+    preserve_technical, spoken_punctuation}. Defaults: everything on — but note refinement
+    itself only runs when an LLM backend is configured (see maybe_refine)."""
+    from services import settings_store
+
+    raw = settings_store.get_text(_SETTINGS_KEY, None)
+    # spoken_punctuation is the deterministic, LLM-free "say 'comma'" switch
+    # (services.dictation_cleanup); off by default because "period" and
+    # "colon" are also ordinary words.
+    cfg = {"auto": True, **RefinementFlags().to_dict(), "spoken_punctuation": False}
+    if raw:
+        try:
+            cfg.update({k: bool(v) for k, v in json.loads(raw).items() if k in cfg})
+        except (ValueError, AttributeError):
+            logger.warning("Invalid %s settings JSON ignored", _SETTINGS_KEY)
+    return cfg
+
+
+def set_refinement_config(cfg: dict) -> dict:
+    from services import settings_store
+
+    merged = get_refinement_config()
+    merged.update({k: bool(v) for k, v in (cfg or {}).items() if k in merged})
+    settings_store.set_text(_SETTINGS_KEY, json.dumps(merged))
+    return merged
+
+
+def refine_transcript(
     transcript: str,
-    flags: RefinementFlags,
-    model_size: str | None = None,
-) -> tuple[str, str]:
-    """Run the transcript through the LLM with the built system prompt.
+    flags: RefinementFlags | None = None,
+    *,
+    timeout_s: float | None = None,
+) -> str:
+    """Run the transcript through the configured LLM. Raises on failure —
+    callers decide the fallback (maybe_refine swallows into pass-through).
 
-    Returns:
-        (refined_text, llm_model_size) — so callers can persist which model
-        produced the refinement.
+    The LLM HTTP call is bounded by ``timeout_s`` (default: the refinement
+    budget) so a dead/slow endpoint can't tie the call up for the client's full
+    45s LLM timeout — the class of stall this whole module guards against."""
+    flags = flags or RefinementFlags()
+    backend = _skill_llm()
+    messages = [{"role": "system", "content": build_refinement_prompt(flags)}]
+    for user_turn, assistant_turn in REFINEMENT_EXAMPLES:
+        messages.append({"role": "user", "content": user_turn})
+        messages.append({"role": "assistant", "content": assistant_turn})
+    messages.append({"role": "user", "content": transcript})
+    budget = timeout_s if timeout_s is not None else _refine_timeout_s()
+    try:
+        reply = backend.chat_messages(
+            messages=messages,
+            timeout=budget,
+            reasoning_effort="none",
+        )
+    except TypeError as exc:
+        if "reasoning_effort" not in str(exc).lower():
+            raise
+        reply = backend.chat_messages(messages=messages, timeout=budget)
+    return reply.strip()
+
+
+def maybe_refine(transcript: str, *, timeout_s: float | None = None) -> str | None:
+    """Best-effort refinement for the dictation final path.
+
+    Returns the refined text, or None when refinement is off, no LLM
+    backend is configured, the result is empty, or anything fails — the
+    raw transcript always stands. Never raises. Records the outcome via
+    :func:`get_last_refine_status` so the UI can flag a failing LLM.
+
+    Blocking (network I/O); the WS/REST callers run it off-thread. Prefer
+    :func:`maybe_refine_async` on the live-dictation path — it adds the hard
+    wall-clock bound so a slow endpoint can never delay the ``final`` send.
     """
-    backend = llm_service.get_llm_model()
-    resolved_size = llm_service.resolve_model_size(backend, model_size)
+    if not transcript or not transcript.strip():
+        return None
+    cfg = get_refinement_config()
+    if not cfg.get("auto", True):
+        return None
+    backend = _skill_llm()
+    if backend.id == "off":
+        # No LLM configured — or the dictation_refinement skill is disabled /
+        # routed to an unconfigured provider — is not a failure. Leave the last
+        # status untouched (same pass-through as today).
+        return None
+    try:
+        refined = refine_transcript(
+            transcript, RefinementFlags.from_dict(cfg), timeout_s=timeout_s
+        )
+        if not refined:
+            return None
+        _note_refine_status(ok=True)
+        return refined
+    except Exception as e:  # noqa: BLE001 — pass-through is the contract
+        logger.warning("Dictation refinement skipped: %s", e)
+        _note_refine_status(ok=False, reason=_short_reason(e))
+        return None
 
-    # Pre-process before the LLM sees the text — the model shouldn't have
-    # to reason about obvious STT garbage (see ``collapse_repetitive_artifacts``).
-    cleaned_input = collapse_repetitive_artifacts(transcript)
 
-    system_prompt = build_refinement_prompt(flags)
-    text = await backend.generate(
-        prompt=cleaned_input,
-        system=system_prompt,
-        max_tokens=2048,
-        temperature=0.2,
-        model_size=resolved_size,
-        examples=REFINEMENT_EXAMPLES,
-    )
-    return text.strip(), resolved_size
+async def maybe_refine_async(
+    transcript: str, *, timeout_s: float | None = None
+) -> str | None:
+    """Async, hard-time-bounded refinement for the live-dictation final path.
+
+    Runs :func:`maybe_refine` off-thread under a hard ``OMNIVOICE_REFINE_TIMEOUT_S``
+    (~4s) budget so a slow or dead LLM endpoint can NEVER block the caller — and
+    therefore the dictation ``final`` send — longer than the budget. On timeout
+    (or any failure) it returns None and the raw, already-polished transcript
+    stands. Never raises.
+
+    ``asyncio.wait_for`` can't cancel the worker thread, but the LLM call it runs
+    is itself bounded to the same budget (see :func:`refine_transcript`), so an
+    orphaned thread unwinds shortly after rather than lingering the full 45s.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    budget = timeout_s if timeout_s is not None else _refine_timeout_s()
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(maybe_refine, transcript, timeout_s=budget),
+            timeout=budget,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Dictation refinement exceeded its %.1fs budget — sending the "
+            "unrefined final (set OMNIVOICE_REFINE_TIMEOUT_S to adjust).", budget,
+        )
+        _note_refine_status(ok=False, reason="timeout")
+        return None
+    except Exception as e:  # noqa: BLE001 — best-effort; the raw final stands
+        logger.warning("Dictation refinement failed: %s", e)
+        _note_refine_status(ok=False, reason=_short_reason(e))
+        return None

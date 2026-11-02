@@ -1,3 +1,8 @@
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
 server {
     listen 80;
     server_name _;
@@ -5,46 +10,64 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Allow large audio uploads, captures, and voice profile imports/exports
-    client_max_body_size 500M;
+    # Allow large audio/video dubbing uploads, reference clips, and audiobook imports
+    client_max_body_size 1G;
 
-    # Never cache runtime config.js so env var changes apply immediately on reload
-    location = /config.js {
+    # Never cache index.html so runtime __OMNIVOICE_API_BASE__ changes apply immediately on reload
+    location = /index.html {
         add_header Cache-Control "no-store, no-cache, must-revalidate";
         try_files $uri =404;
     }
 
-    # Reverse-proxy all Voicebox API, SSE progress streams, audio, and MCP calls
-    # to the remote NVIDIA DGX Spark GPU VM backend
+    # Reverse-proxy all VoiceStudio API, WebSocket (/ws/events, /ws/transcribe, /ws/tts),
+    # SSE streams (/setup/download-stream, /tasks/stream), auth (/api/auth/*),
+    # settings (/api/settings/*), and media calls to the remote NVIDIA DGX Spark GPU VM.
+    # Note: VoiceStudio's joinApiPath("/api", "/api/settings") produces "/api/api/settings",
+    # so stripping the leading "/api/" transport prefix preserves logical "/api/*" backend routes.
     location /api/ {
         proxy_pass ${DGX_BACKEND_URL}/;
         proxy_http_version 1.1;
 
-        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Connection "";
 
-        # Required for real-time Server-Sent Events (SSE) on model downloads & TTS queue
+        # Disable buffering for real-time SSE model downloads, streaming TTS, and WebSockets
         proxy_buffering off;
         proxy_cache off;
         chunked_transfer_encoding on;
 
-        # Long timeouts for large model downloads and multi-chunk TTS generation
+        # Generous timeouts for model downloads, dubbing, and long-form audiobook generation
         proxy_connect_timeout 60s;
         proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
     }
 
-    # Static hashed assets
+    # Direct pass-through for static media mounts and OpenAI-compatible /v1/* endpoints
+    location ~ ^/(audio|voice_audio|demo_audio|v1)/ {
+        proxy_pass ${DGX_BACKEND_URL};
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    # Static hashed Vite assets
     location /assets/ {
         expires 1y;
         add_header Cache-Control "public, immutable";
         try_files $uri =404;
     }
 
-    # SPA fallback for client-side routes (/voices, /stories, /captures, /models, /settings)
+    # SPA fallback for client-side routes (/clone, /personas, /design, /dub, /stories, /audiobook, /settings/*)
     location / {
         try_files $uri $uri/ /index.html;
     }

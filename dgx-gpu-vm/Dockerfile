@@ -1,91 +1,118 @@
 # ============================================================
-# Voicebox Headless GPU Backend & Model Engine (NVIDIA DGX Spark)
-# Runs ONLY the FastAPI Model & Inference Server (no Web UI bundled)
-# Supports NVIDIA DGX Spark (ARM64 Grace Blackwell GB10) & x86_64 CUDA GPUs
+# VoiceStudio Headless GPU Backend & Model Engine (NVIDIA DGX Spark)
+# Based on official debpalash/voicestudio deploy/Dockerfile
+# Runs ONLY the FastAPI Model & Inference Server (port 3900)
+# Automatically selects:
+#   - linux/arm64 (NVIDIA DGX Spark GB10 / GH200 / GB200) -> cuda-arm64-base (Ubuntu 24.04 + PyTorch 2.8.0 cu129)
+#   - linux/amd64 (x86_64 NVIDIA CUDA GPUs)               -> cuda-amd64-base (pytorch:2.8.0-cuda12.8-cudnn9-runtime)
 # ============================================================
 
-ARG PYTORCH_VARIANT=cuda
-ARG CUDA_VERSION=cu128
-ARG ROCM_VERSION=6.3
+ARG TARGETARCH=arm64
+ARG BASE_IMAGE=cuda-${TARGETARCH}-base
 
-# === Stage 1: Build Python & CUDA dependencies ===
-FROM python:3.12-slim AS backend-builder
+# ==========================================
+# amd64 NVIDIA CUDA base (x86_64 servers)
+# ==========================================
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime AS cuda-amd64-base
 
-ARG PYTORCH_VARIANT=cuda
-ARG CUDA_VERSION=cu128
-ARG ROCM_VERSION=6.3
-
-WORKDIR /build
-
+# ==========================================
+# arm64 NVIDIA CUDA base (NVIDIA DGX Spark / GB10, GH200, GB200)
+# ==========================================
+# PyTorch's cu128 index has no aarch64 2.8.0 build; cu129 has all three wheels
+# for cp312 and bundles CUDA + cuDNN 9 libraries natively for linux/arm64.
+FROM ubuntu:24.04 AS cuda-arm64-base
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    build-essential \
-    cmake \
+    python3 \
+    python3-dev \
+    python3-pip \
     pkg-config \
+    cmake \
+    libopus-dev \
     && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu129 \
+    torch==2.8.0+cu129 torchaudio==2.8.0 torchvision==0.23.0
 
-RUN pip install --no-cache-dir --upgrade pip
-
-COPY backend/requirements.txt .
-
-# Install GPU-accelerated PyTorch first so subsequent packages resolve against it.
-# On NVIDIA DGX Spark (aarch64 + GB10 Blackwell), cu128 provides native ARM64 CUDA wheels.
-RUN if [ "$PYTORCH_VARIANT" = "cuda" ]; then \
-      pip install --no-cache-dir --prefix=/install \
-        --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" \
-        torch torchaudio && \
-      printf '[global]\nindex-url = https://download.pytorch.org/whl/%s\nextra-index-url = https://pypi.org/simple\n' "$CUDA_VERSION" > /etc/pip.conf; \
-    elif [ "$PYTORCH_VARIANT" = "rocm" ]; then \
-      pip install --no-cache-dir --prefix=/install \
-        --index-url "https://download.pytorch.org/whl/rocm${ROCM_VERSION}" \
-        torch torchaudio && \
-      printf '[global]\nindex-url = https://download.pytorch.org/whl/rocm%s\nextra-index-url = https://pypi.org/simple\n' "$ROCM_VERSION" > /etc/pip.conf; \
-    fi
-
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-RUN pip install --no-cache-dir --prefix=/install --no-deps chatterbox-tts
-RUN pip install --no-cache-dir --prefix=/install --no-deps hume-tada
-RUN pip install --no-cache-dir --prefix=/install --no-deps omnivoice
-RUN pip install --no-cache-dir --prefix=/install \
-    git+https://github.com/QwenLM/Qwen3-TTS.git
-
-
-# === Stage 2: Headless Backend Runtime ===
-FROM python:3.12-slim
-
-RUN groupadd -r voicebox && \
-    useradd -r -g voicebox -m -s /bin/bash voicebox
-
-RUN mkdir -p /home/voicebox/.cache/huggingface \
-    && chown -R voicebox:voicebox /home/voicebox/.cache
-
+# ==========================================
+# Runtime Stage: Python & PyTorch Backend
+# ==========================================
+FROM ${BASE_IMAGE} AS runtime
 WORKDIR /app
 
-# Runtime dependencies:
-# - ffmpeg & sox: audio decoding/normalization (Required by Qwen-TTS, Whisper, etc.)
-# - gcc & g++: required by Triton JIT compiler on CUDA GPUs (including DGX Spark GB10)
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV OMNIVOICE_DATA_DIR=/app/omnivoice_data
+ENV HF_HOME=/app/omnivoice_data/huggingface
+ENV PYTHONPATH=/app/backend
+# Headless server deployment: relax the desktop-only loopback origin gate
+# so the remote Web UI VM and Docker NAT can reach /system/* and /api/settings/*.
+ENV OMNIVOICE_SERVER_MODE=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ffmpeg \
-    sox \
-    gcc \
-    g++ \
+    libsndfile1 \
     curl \
-    gosu \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=backend-builder /install /usr/local
-COPY --chown=voicebox:voicebox backend/ /app/backend/
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
 
-RUN mkdir -p /app/data/generations /app/data/profiles /app/data/captures /app/data/cache \
-    && chown -R voicebox:voicebox /app/data
+RUN python3 -m pip install --no-cache-dir uv
 
-EXPOSE 17493
+COPY pyproject.toml uv.lock README.md ./
+COPY deploy/torch-constraints.txt ./deploy/torch-constraints.txt
+COPY deploy/uv-overrides.txt ./deploy/uv-overrides.txt
+COPY omnivoice/ ./omnivoice/
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
-    CMD curl -f http://localhost:17493/health || exit 1
+RUN uv pip install --python "$(command -v python3)" --no-cache \
+    --constraint deploy/torch-constraints.txt \
+    --override deploy/uv-overrides.txt .
 
-COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh
+# Guard: verify security overrides from deploy/uv-overrides.txt
+RUN python3 -c "from importlib.metadata import version; from packaging.requirements import Requirement; \
+    reqs = [Requirement(l.strip()) for l in open('deploy/uv-overrides.txt') if l.strip() and not l.lstrip().startswith('#')]; \
+    bad = [f'{r.name} {version(r.name)} does not satisfy {r}' for r in reqs if not r.specifier.contains(version(r.name), prereleases=True)]; \
+    assert not bad, bad; \
+    print('uv overrides applied:', ', '.join(f'{r.name} {version(r.name)}' for r in reqs))"
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493"]
+# Guard: verify GPU PyTorch & torchvision C++ ops were not clobbered
+ARG GPU_FLAVOR=cuda
+RUN python3 -c "import os, torch, torchaudio, torchvision; \
+    flavor = os.environ['GPU_FLAVOR']; \
+    accel = torch.version.hip if flavor == 'rocm' else torch.version.cuda; \
+    print(f'torch={torch.__version__} torchaudio={torchaudio.__version__} torchvision={torchvision.__version__} {flavor}={accel}'); \
+    assert accel, f'base image {flavor} torch was clobbered (now {torch.__version__})'; \
+    import torchvision.ops; torchvision.ops.nms; \
+    print('torchvision C++ ops resolve against this torch')"
+
+# cuDNN 8 side-load for CTranslate2 (WhisperX, faster-whisper) on x86_64 CUDA.
+# Skipped on aarch64 (DGX Spark / GH200) where nvidia-cudnn-cu12==8.9.7.29 has no wheel.
+RUN if [ "$GPU_FLAVOR" = "cuda" ] && [ "$(uname -m)" != "aarch64" ]; then \
+        target="$(python3 -c "import sys; print(f'{sys.prefix}/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages/cudnn8_compat')")" \
+        && uv pip install --python "$(command -v python3)" --no-cache --no-deps \
+            --target "$target" nvidia-cudnn-cu12==8.9.7.29 \
+        && CUDNN8_TARGET="$target" python3 -c "import glob, os; t = os.environ['CUDNN8_TARGET']; found = [f for f in glob.glob(t + '/nvidia/cudnn/lib/*') if '.so.8' in f]; assert found, 'cuDNN 8 libraries missing from ' + t; print(f'cuDNN 8 compat: {len(found)} libraries in ' + t)"; \
+    else \
+        echo "cuDNN 8 compat skipped (GPU_FLAVOR=$GPU_FLAVOR, arch=$(uname -m))"; \
+    fi
+
+COPY backend/ ./backend/
+COPY config/ ./config/
+COPY alembic.ini ./
+
+EXPOSE 3900
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
+    CMD ["python3", "backend/docker_entrypoint.py", "--health-check"]
+
+VOLUME ["/app/omnivoice_data"]
+
+ENV OMNIVOICE_BIND_HOST=0.0.0.0
+ARG BUILD_COMMIT=unknown
+ENV OMNIVOICE_BUILD_COMMIT=${BUILD_COMMIT}
+ENTRYPOINT ["python3", "backend/docker_entrypoint.py"]

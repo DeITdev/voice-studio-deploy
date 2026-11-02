@@ -1,40 +1,61 @@
 # ============================================================
-# Voicebox Headless GPU Backend (NVIDIA DGX Spark GPU VM)
+# VoiceStudio Headless GPU Backend (NVIDIA DGX Spark GPU VM)
 # Copy this `dgx-gpu-vm` folder to your DGX Spark VM and run:
-#   cp .env.example .env
+#   cp .env.example .env   # set OMNIVOICE_API_KEY
+#   mkdir -p omnivoice_data models
 #   docker compose up -d --build
 # ============================================================
 
 services:
-  voicebox-dgx-backend:
+  voicestudio-dgx-backend:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        PYTORCH_VARIANT: ${PYTORCH_VARIANT:-cuda}
-        CUDA_VERSION: ${CUDA_VERSION:-cu128}
-    container_name: voicebox-dgx-backend
+        GPU_FLAVOR: ${GPU_FLAVOR:-cuda}
+    # Optional: instead of building from source, you can pull the official ARM64 CUDA image:
+    # image: ghcr.io/debpalash/voicestudio:stable-cuda-arm64
+    container_name: voicestudio-dgx-backend
     restart: unless-stopped
 
     # Shared memory / host IPC recommended for PyTorch CUDA on DGX systems
     ipc: host
 
     ports:
-      # Exposes the Voicebox API on the DGX VM so the Web UI VM can connect to it
-      - "0.0.0.0:${BACKEND_PORT:-17493}:17493"
+      # Exposes the VoiceStudio API (port 3900) on the DGX VM so the Web UI VM can connect to it
+      - "0.0.0.0:${BACKEND_PORT:-3900}:3900"
 
     volumes:
-      # All downloaded TTS, Whisper ASR, and Dictation/LLM models are stored here on the DGX VM
-      - ${MODELS_HOST_DIR:-./models}:/home/voicebox/.cache/huggingface
+      # Persistent application state (SQLite DB, saved voices, projects, settings, encrypted HF token)
+      - ${DATA_HOST_DIR:-./omnivoice_data}:/app/omnivoice_data
 
-      # Persistent storage for voice profiles, SQLite database, captures, and generated audio
-      - ${DATA_HOST_DIR:-./data}:/app/data
+      # Persistent Hugging Face model cache (OmniVoice, CosyVoice, Whisper, etc.) on the DGX VM
+      - ${MODELS_HOST_DIR:-./models}:/app/omnivoice_data/huggingface
 
     environment:
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - NUMBA_CACHE_DIR=/tmp/numba_cache
-      # Optional comma-separated list of allowed CORS origins (e.g. http://<WEB-VM-IP>:17600)
-      - VOICEBOX_CORS_ORIGINS=${VOICEBOX_CORS_ORIGINS:-}
+      - OMNIVOICE_DATA_DIR=/app/omnivoice_data
+      - HF_HOME=/app/omnivoice_data/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      - PYTHONPATH=/app/backend
+      - PYTHONUNBUFFERED=1
+      # Headless server mode: relaxes the desktop loopback-origin gate for Docker / remote Web VM
+      - OMNIVOICE_SERVER_MODE=1
+      # Administrator API key required for server-mode settings, model installs, and diagnostics.
+      # Generate with: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+      - OMNIVOICE_API_KEY=${OMNIVOICE_API_KEY:?Set a long random OMNIVOICE_API_KEY in .env before starting}
+      # Optional: comma-separated allowed browser origins (e.g. http://<WEB-VM-IP>:17600)
+      - OMNIVOICE_ALLOWED_ORIGINS=${OMNIVOICE_ALLOWED_ORIGINS:-}
+      # Optional: comma-separated extra hostnames (or * behind a trusted reverse proxy)
+      - OMNIVOICE_ALLOWED_HOSTS=${OMNIVOICE_ALLOWED_HOSTS:-*}
+      # Optional: disable opt-in product analytics completely
+      - OMNIVOICE_ANALYTICS_DISABLED=${OMNIVOICE_ANALYTICS_DISABLED:-1}
+
+    healthcheck:
+      test: ["CMD", "python3", "backend/docker_entrypoint.py", "--health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
 
     deploy:
       resources:

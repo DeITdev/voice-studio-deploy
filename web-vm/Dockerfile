@@ -1,43 +1,45 @@
 # ============================================================
-# Voicebox Web Studio UI (Frontend-Only Container)
-# Runs on the Non-GPU App VM and connects to the DGX Spark GPU VM
+# VoiceStudio Web UI (Frontend-Only Container)
+# Based on official debpalash/voicestudio deploy/Dockerfile frontend stage
+# Runs on the Non-GPU Web VM and connects to the DGX Spark GPU VM (port 3900)
 # ============================================================
 
-# === Stage 1: Build React SPA ===
-FROM oven/bun:1 AS frontend-builder
+# === Stage 1: Build VoiceStudio React 19 SPA ===
+FROM oven/bun:1.4.2-alpine AS frontend-builder
+WORKDIR /app
 
-WORKDIR /build
+# Monorepo — bun workspace with lockfile at root
+COPY package.json bun.lock ./
+COPY electron/package.json ./electron/
+COPY patches/ ./patches/
+COPY config/ ./config/
 
-COPY package.json bun.lock CHANGELOG.md ./
-COPY app/ ./app/
-COPY web/ ./web/
+RUN bun install --frozen-lockfile
 
-# Normalize line endings and strip desktop (tauri) workspace for web-only build
-RUN sed -i 's/\r$//' package.json && \
-    sed -i '/"tauri"/d' package.json && \
-    sed -i -z 's/,\n  ]/\n  ]/' package.json
-
-RUN bun install --no-save
-RUN cd web && bunx --bun vite build
+# Build the maintained VoiceStudio renderer as the browser UI (-> /app/frontend/dist)
+COPY frontend/ ./frontend/
+COPY electron/ ./electron/
+RUN bun run --cwd electron build:web
 
 
 # === Stage 2: Lightweight Nginx Web & Reverse Proxy Runtime ===
 FROM nginx:1.27-alpine
 
-RUN apk add --no-cache curl gettext
+RUN apk add --no-cache curl gettext openssl
 
 # Copy built static SPA assets
-COPY --from=frontend-builder /build/web/dist /usr/share/nginx/html
+COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html
+RUN cp /usr/share/nginx/html/index.html /usr/share/nginx/html/index.html.orig
 
 # Copy Nginx reverse-proxy template (rendered by entrypoint.sh after sanitizing DGX_BACKEND_URL)
-COPY nginx.conf.template /etc/nginx/voicebox.conf.template
+COPY nginx.conf.template /etc/nginx/voicestudio.conf.template
 
-# Copy startup hook that writes /usr/share/nginx/html/config.js and /etc/nginx/conf.d/default.conf
-COPY --chmod=755 entrypoint.sh /docker-entrypoint.d/40-voicebox-config.sh
-RUN sed -i 's/\r$//' /docker-entrypoint.d/40-voicebox-config.sh /etc/nginx/voicebox.conf.template
+# Copy startup hook that injects window.__OMNIVOICE_API_BASE__ + CSP sha256 into index.html
+COPY --chmod=755 entrypoint.sh /docker-entrypoint.d/40-voicestudio-config.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.d/40-voicestudio-config.sh /etc/nginx/voicestudio.conf.template
 
-ENV DGX_BACKEND_URL=http://127.0.0.1:17493
-ENV FRONTEND_SERVER_URL=/api
+ENV DGX_BACKEND_URL=http://127.0.0.1:3900
+ENV FRONTEND_API_BASE=/api
 
 EXPOSE 80
 

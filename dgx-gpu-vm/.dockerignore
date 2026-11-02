@@ -1,0 +1,19 @@
+# VoiceStudio Headless Backend Docker Ignore
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.db
+*.sqlite
+*.sqlite3
+omnivoice_data/
+models/
+data/
+.env
+.git/
+.DS_Store

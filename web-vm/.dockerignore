@@ -1,0 +1,9 @@
+# VoiceStudio Frontend Docker Ignore
+node_modules/
+.turbo/
+frontend/dist/
+electron/out/
+electron/release/
+.env
+.git/
+.DS_Store

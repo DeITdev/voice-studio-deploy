@@ -1,49 +1,47 @@
 {
-  "name": "voicebox",
-  "version": "0.6.0",
+  "name": "omnivoice-studio-monorepo",
+  "version": "0.5.7",
+  "license": "AGPL-3.0-only",
   "private": true,
-  "workspaces": [
-    "app",
-    "tauri",
-    "web"
-  ],
+  "packageManager": "bun@1.4.2",
   "scripts": {
-    "dev": "bun run setup:dev && cd tauri && bun run tauri dev",
-    "dev:web": "cd web && bun run dev",
-    "dev:server": "uvicorn backend.main:app --reload --port 17493",
-    "setup:dev": "bun run scripts/setup-dev-sidecar.js",
-    "build": "./scripts/build-server.sh && cd tauri && bun run tauri build",
-    "build:web": "cd web && bun run build",
-    "build:release": "./scripts/prepare-release.sh",
-    "generate:api": "./scripts/generate-api.sh",
-    "generate:keys": "cd tauri && bun tauri signer generate -w ~/.tauri/voicebox.key",
-    "build:server": "./scripts/build-server.sh",
-    "update:icons": "./scripts/update-icons.sh",
-    "convert:assets": "./scripts/convert-assets.sh",
-    "lint": "biome lint .",
-    "typecheck": "bunx tsc -p app/tsconfig.json --noEmit && cd web && bunx tsc --noEmit",
-    "lint:fix": "biome lint --write .",
-    "format": "biome format --write .",
-    "format:check": "biome format .",
-    "check": "biome check .",
-    "check:fix": "biome check --write .",
-    "ci": "bun run typecheck && bun run build:web"
+    "setup:api": "node scripts/setup-api.mjs",
+    "dev:api": "bun scripts/dev-backend.mjs",
+    "dev:frontend": "bun run --cwd electron dev:web",
+    "dev:desktop": "bun run --cwd electron dev",
+    "wait:api": "node scripts/wait-app-port.mjs api",
+    "wait:frontend": "node scripts/wait-app-port.mjs web",
+    "predev": "node scripts/prepare-dev.mjs",
+    "dev": "bun run --cwd electron dev",
+    "predesktop": "bun install",
+    "desktop": "bun run --cwd electron dev",
+    "build": "bun run --cwd electron build",
+    "check:electron": "node scripts/validate_store_foundation.mjs && bun run --cwd electron typecheck && bun run --cwd electron test && bun run --cwd electron build && bun run --cwd electron build:web && node electron/tests/packaging-contract.mjs",
+    "start": "bun run --cwd electron start",
+    "test:frontend": "node --test tests/frontend/*.test.mjs",
+    "smoke-test": "node scripts/electron-smoke-test.mjs",
+    "deps:check": "taze -r --maturity-period 7",
+    "dev:web": "bun run setup:api && concurrently -n api,fe -c green,cyan --kill-others-on-fail \"bun run dev:api\" \"bun run dev:frontend\"",
+    "predev:web": "bun install && bun scripts/clear-dev-ports.mjs",
+    "build:web": "bun run --cwd electron build:web",
+    "dist": "bun run --cwd electron dist --publish never",
+    "desktop-prod": "bun run build && bun run start",
+    "desktop-prod:run": "bun run start",
+    "desktop-prod:upgrade": "bun run desktop-prod",
+    "test": "bun run --cwd electron test",
+    "typecheck": "bun run --cwd electron typecheck",
+    "lint": "bun run --cwd electron lint",
+    "format": "bun run --cwd electron format",
+    "dist:dir": "bun run --cwd electron dist:dir --publish never"
   },
+  "workspaces": ["electron"],
   "devDependencies": {
-    "@biomejs/biome": "2.3.12",
-    "@types/node": "^20.0.0",
-    "tailwindcss": "^4.1.18",
-    "typescript": "^5.6.0"
+    "concurrently": "^10.0.6",
+    "playwright": "^1.64.1",
+    "taze": "^21.3.0",
+    "wait-on": "^9.5.1"
   },
-  "engines": {
-    "bun": ">=1.0.0"
-  },
-  "packageManager": "bun@1.3.8",
-  "dependencies": {
-    "loaders.css": "^0.1.2",
-    "react-loaders": "^3.0.1"
-  },
-  "overrides": {
-    "seroval": "1.5.3"
+  "patchedDependencies": {
+    "app-builder-lib@26.15.3": "patches/app-builder-lib-26.15.3.patch"
   }
 }
