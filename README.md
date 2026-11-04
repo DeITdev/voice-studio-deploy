@@ -55,3 +55,33 @@ This repository is **100% self-contained** for deploying **VoiceStudio** ([`debp
    - Enter the `OMNIVOICE_API_KEY` from Step 1 when prompted.
    - Check **Settings → Performance & Device** to confirm the DGX Spark GPU is active.
    - Go to **Settings → Models** to install TTS, ASR, and dubbing models—all weights download directly into `~/voicestudio-dgx/models` on your **DGX Spark VM** and run on the DGX GPU.
+
+---
+
+## Deploying Behind a Public Domain / HTTPS Reverse Proxy (e.g. `https://avatar-voice.hcm-lab.id`)
+
+If exposing the Web UI via a public domain or an SSL-terminating reverse proxy (Cloudflare, Caddy, Nginx Proxy Manager, Traefik), you must configure **two things** to prevent `403 Forbidden` errors:
+
+1. **On your DGX Spark GPU VM (`~/voicestudio-dgx/.env`)**:
+   Add your public domain to `OMNIVOICE_ALLOWED_ORIGINS`:
+   ```env
+   OMNIVOICE_ALLOWED_ORIGINS=https://avatar-voice.hcm-lab.id
+   OMNIVOICE_ALLOWED_HOSTS=avatar-voice.hcm-lab.id,*
+   ```
+   Restart the DGX backend:
+   ```bash
+   docker compose up -d
+   ```
+
+2. **In your public reverse proxy configuration (e.g. host Nginx / Cloudflare Tunnel / Caddy)**:
+   Ensure the following headers are passed to the Web VM (port `17600`):
+   ```nginx
+   proxy_set_header Host $host;
+   proxy_set_header X-Real-IP $remote_addr;
+   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   proxy_set_header X-Forwarded-Proto https;
+
+   # For real-time WebSockets (/ws/events, /ws/transcribe, /ws/tts)
+   proxy_set_header Upgrade $http_upgrade;
+   proxy_set_header Connection "upgrade";
+   ```

@@ -27,7 +27,7 @@ esac
 
 sed \
   -e "s|script-src 'self'|script-src 'self' 'sha256-${DIGEST}'|" \
-  -e "s|connect-src 'self'|connect-src 'self'${CONNECT_EXTRA}|" \
+  -e "s|connect-src 'self'|connect-src 'self' wss:${CONNECT_EXTRA}|" \
   -e "s|<head>|<head><script>${SCRIPT}</script>|" \
   /usr/share/nginx/html/index.html.orig > /usr/share/nginx/html/index.html
 
