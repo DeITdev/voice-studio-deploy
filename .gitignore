@@ -1,0 +1,4 @@
+dgx-gpu-vm/models/
+dgx-gpu-vm/omnivoice_data/
+dgx-gpu-vm/.env
+.env
